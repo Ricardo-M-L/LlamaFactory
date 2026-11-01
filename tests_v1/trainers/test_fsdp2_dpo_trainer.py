@@ -21,7 +21,7 @@ import pytest
 
 
 @pytest.mark.xfail(reason="CI machines may OOM when heavily loaded.")
-@pytest.mark.runs_on(["cuda", "npu"])
+@pytest.mark.runs_on(["cuda", "npu", "xpu"])
 def test_fsdp2_dpo_trainer(tmp_path: Path):
     """Test FSDP2 DPO trainer with sigmoid loss by simulating `llamafactory-cli dpo config.yaml`."""
     config_yaml = """\
@@ -29,11 +29,8 @@ model: Qwen/Qwen3-0.6B
 trust_remote_code: true
 model_class: llm
 
-template: qwen3_nothink
-
 kernel_config:
     name: auto
-    include_kernels: auto
 
 quant_config: null
 
@@ -42,7 +39,7 @@ dist_config:
     dcp_path: null
 
 init_config:
-    name: init_on_meta
+    name: init_on_default
 
 # PEFT Configuration
 peft_config:

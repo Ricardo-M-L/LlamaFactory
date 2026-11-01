@@ -150,6 +150,12 @@ class Template:
                 elements += self.format_prefix.apply()
                 if system or tools:
                     tool_text = self.format_tools.apply(content=tools)[0] if tools else ""
+                    if tools and not system:
+                        # Tool prompts that separate themselves from the system message with a
+                        # leading newline would otherwise emit a blank line when there is no
+                        # system message to separate from.
+                        tool_text = tool_text.lstrip("\n")
+
                     elements += self.format_system.apply(content=(system + tool_text))
 
             if message["role"] == Role.USER:
@@ -334,6 +340,117 @@ class Template:
 
 
 @dataclass
+class Glm5NextTemplate(Template):
+    r"""GLM-5.3-Flash template with preserved thinking and EOS only on the final assistant response."""
+
+    @override
+    def _encode(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str],
+        tools: Optional[str],
+    ) -> list[list[int]]:
+        if not messages or len(messages) % 2 or messages[0]["role"] != Role.USER:
+            raise ValueError(
+                "glm5_next expects alternating user/observation and assistant/function pairs, starting with user."
+            )
+
+        system = system or self.default_system
+        encoded = []
+        for i, message in enumerate(messages):
+            role, content = message["role"], message["content"]
+            expected = (Role.USER, Role.OBSERVATION) if i % 2 == 0 else (Role.ASSISTANT, Role.FUNCTION)
+            if role not in expected or not isinstance(content, str):
+                raise ValueError(
+                    "glm5_next expects alternating user/observation and assistant/function text messages."
+                )
+            if message.get("tool_calls"):
+                raise ValueError("glm5_next expects tool calls as JSON in role=function content (v0 ShareGPT format).")
+            if i % 2 == 0 and i > 0:
+                after_function = messages[i - 1]["role"] == Role.FUNCTION
+                if (role == Role.OBSERVATION) != after_function:
+                    raise ValueError("glm5_next requires an observation after each function turn.")
+
+            elements = []
+            if i == 0:
+                elements += self.format_prefix.apply()
+                if tools:
+                    elements += self.format_tools.apply(content=tools)
+                if system:
+                    elements += self.format_system.apply(content=system)
+
+            if role == Role.USER:
+                elements += self.format_user.apply(content=content)
+            elif role == Role.OBSERVATION:
+                elements += self.format_observation.apply(content=content)
+            else:
+                if role == Role.FUNCTION:
+                    content = self.format_function.apply(
+                        content=content,
+                        thought_words=self.thought_words,
+                        tool_call_words=self.tool_call_words,
+                    )[0]
+                if "</think>" in content:
+                    reasoning = content.split("</think>")[0].split("<think>")[-1]
+                    content = content.split("</think>")[-1]
+                else:
+                    reasoning = ""
+                elements += self.format_assistant.apply(content=reasoning + "</think>" + content.strip())
+                if role == Role.FUNCTION:
+                    # Supervise the observation marker so the model learns to hand control to tools.
+                    elements += ["<|observation|>"]
+                elif i == len(messages) - 1:
+                    elements += [{"eos_token"}]
+            encoded.append(self._convert_elements_to_ids(tokenizer, elements))
+        return encoded
+
+
+@dataclass
+class MossVLTemplate(Template):
+    @override
+    def _encode(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str],
+        tools: Optional[str],
+    ) -> list[list[int]]:
+        system = system or self.default_system
+        encoded_messages = []
+        for i, message in enumerate(messages):
+            elements = []
+
+            if i == 0:
+                elements += self.format_prefix.apply()
+                if system or tools:
+                    tool_text = self.format_tools.apply(content=tools)[0] if tools else ""
+                    if tools and not system:
+                        tool_text = tool_text.lstrip("\n")
+
+                    elements += self.format_system.apply(content=(system + tool_text))
+
+            if message["role"] == Role.USER:
+                elements += self.format_user.apply(content=message["content"], idx=str(i // 2))
+            elif message["role"] == Role.ASSISTANT:
+                elements += self.format_assistant.apply(content=message["content"])
+            elif message["role"] == Role.OBSERVATION:
+                elements += self.format_observation.apply(content=message["content"])
+            elif message["role"] == Role.FUNCTION:
+                elements += self.format_function.apply(
+                    content=message["content"],
+                    thought_words=self.thought_words,
+                    tool_call_words=self.tool_call_words,
+                )
+            else:
+                raise NotImplementedError("Unexpected role: {}".format(message["role"]))
+
+            encoded_messages.append(self._convert_elements_to_ids(tokenizer, elements))
+
+        return encoded_messages
+
+
+@dataclass
 class Llama2Template(Template):
     r"""A template that fuse the system message to first user message."""
 
@@ -473,6 +590,80 @@ class ReasoningTemplate(Template):
 
 
 @dataclass
+class Qwen38ReasoningTemplate(ReasoningTemplate):
+    r"""Qwen3.8 template with reasoning-effort instructions and official system ordering."""
+
+    reasoning_effort: str = "xhigh"
+
+    def _get_reasoning_instruction(self) -> str:
+        if self.enable_thinking is False:
+            return ""
+
+        if self.reasoning_effort == "xhigh":
+            return (
+                "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+                "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final "
+                "answer."
+            )
+        elif self.reasoning_effort == "medium":
+            return ""
+        elif self.reasoning_effort == "low":
+            return (
+                "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
+                "conclusion without unnecessary elaboration."
+            )
+        else:
+            # Defensive validation for callers that configure the template without DataArguments.
+            raise ValueError(
+                f"Unexpected reasoning effort {self.reasoning_effort}. "
+                "Supported types are xhigh (default), medium, and low."
+            )
+
+    @override
+    def _encode(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str],
+        tools: Optional[str],
+    ) -> list[list[int]]:
+        system = (system or self.default_system).strip()
+        reasoning_instruction = self._get_reasoning_instruction()
+        encoded_messages = []
+        for i, message in enumerate(messages):
+            elements = []
+
+            if i == 0:
+                elements += self.format_prefix.apply()
+                system_parts = []
+                if reasoning_instruction:
+                    system_parts.append(reasoning_instruction)
+                if tools:
+                    system_parts.append(self.format_tools.apply(content=tools)[0].lstrip("\n"))
+                if system:
+                    system_parts.append(system)
+                if system_parts:
+                    elements += self.format_system.apply(content="\n\n".join(system_parts))
+
+            if message["role"] == Role.USER:
+                elements += self.format_user.apply(content=message["content"], idx=str(i // 2))
+            elif message["role"] == Role.ASSISTANT:
+                elements += self.format_assistant.apply(content=message["content"])
+            elif message["role"] == Role.OBSERVATION:
+                elements += self.format_observation.apply(content=message["content"])
+            elif message["role"] == Role.FUNCTION:
+                elements += self.format_function.apply(
+                    content=message["content"], thought_words=self.thought_words, tool_call_words=self.tool_call_words
+                )
+            else:
+                raise NotImplementedError("Unexpected role: {}".format(message["role"]))
+
+            encoded_messages.append(self._convert_elements_to_ids(tokenizer, elements))
+
+        return encoded_messages
+
+
+@dataclass
 class Glm47ReasoningTemplate(ReasoningTemplate):
     r"""GLM-4.7 uses only the closing </think> tag for empty thinking blocks."""
 
@@ -482,6 +673,62 @@ class Glm47ReasoningTemplate(ReasoningTemplate):
             return self.thought_words[1]
 
         return self.thought_words[0] + content + self.thought_words[1]
+
+
+@dataclass
+class Xing4ReasoningTemplate(ReasoningTemplate):
+    r"""Xing4.0 places the thinking-mode marker in the generation prompt."""
+
+    @override
+    def add_thought(self, content: str = "") -> str:
+        if not self.enable_thinking:
+            return self.thought_words[1] + content
+
+        return self.thought_words[0] + "\n" + self.thought_words[1] + content
+
+    def _move_thought_prefix(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        prompt_ids: list[int],
+        response_ids: list[int],
+    ) -> tuple[list[int], list[int]]:
+        if not self.enable_thinking:
+            return prompt_ids, response_ids
+
+        thought_prefix_ids = tokenizer.encode(self.thought_words[0], add_special_tokens=False)
+        if response_ids[: len(thought_prefix_ids)] == thought_prefix_ids:
+            prompt_ids += thought_prefix_ids
+            response_ids = response_ids[len(thought_prefix_ids) :]
+
+        return prompt_ids, response_ids
+
+    @override
+    def encode_oneturn(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str] = None,
+        tools: Optional[str] = None,
+    ) -> tuple[list[int], list[int]]:
+        prompt_ids, response_ids = super().encode_oneturn(tokenizer, messages, system, tools)
+        return self._move_thought_prefix(tokenizer, prompt_ids, response_ids)
+
+    @override
+    def encode_multiturn(
+        self,
+        tokenizer: "PreTrainedTokenizer",
+        messages: list[dict[str, str]],
+        system: Optional[str] = None,
+        tools: Optional[str] = None,
+        discarding_history_cot: bool = False,
+    ) -> list[tuple[list[int], list[int]]]:
+        encoded_pairs = super().encode_multiturn(
+            tokenizer, messages, system, tools, discarding_history_cot=discarding_history_cot
+        )
+        return [
+            self._move_thought_prefix(tokenizer, prompt_ids, response_ids)
+            for prompt_ids, response_ids in encoded_pairs
+        ]
 
 
 TEMPLATES: dict[str, "Template"] = {}
@@ -643,6 +890,9 @@ def get_template_and_fix_tokenizer(tokenizer: "PreTrainedTokenizer", data_args: 
     if data_args.train_on_prompt and template.efficient_eos:
         raise ValueError("Current template does not support `train_on_prompt`.")
 
+    if isinstance(template, Qwen38ReasoningTemplate) and data_args.tool_format not in {None, "qwen3_8"}:
+        raise ValueError("Template `qwen3_8` uses its built-in tool format; remove the incompatible `tool_format`.")
+
     if data_args.tool_format is not None:
         logger.info_rank0(f"Using tool format: {data_args.tool_format}.")
         default_slots = ["{{content}}"] if template.efficient_eos else ["{{content}}", {"eos_token"}]
@@ -662,7 +912,11 @@ def get_template_and_fix_tokenizer(tokenizer: "PreTrainedTokenizer", data_args: 
             "e.g., qwen3_vl_nothink"
         )
         template.enable_thinking = data_args.enable_thinking
-        template.preserve_thinking = data_args.preserve_thinking
+        if isinstance(template, Qwen38ReasoningTemplate):
+            template.reasoning_effort = data_args.reasoning_effort
+            template.preserve_thinking = True if data_args.preserve_thinking is None else data_args.preserve_thinking
+        elif data_args.preserve_thinking is not None:
+            template.preserve_thinking = data_args.preserve_thinking
 
     template.fix_special_tokens(tokenizer)
     template.fix_jinja_template(tokenizer)
@@ -1077,6 +1331,23 @@ register_template(
         audio_token="<|audio|>",
     ),
     template_class=ReasoningTemplate,
+)
+
+
+register_template(
+    name="glm5_next",
+    format_user=StringFormatter(slots=["<|user|>{{content}}<|assistant|><think>"]),
+    format_assistant=StringFormatter(slots=["{{content}}"]),
+    format_system=StringFormatter(slots=["<|system|>{{content}}"]),
+    format_function=FunctionFormatter(slots=["{{content}}"], tool_format="glm5_next"),
+    format_observation=StringFormatter(slots=["<tool_response>{{content}}</tool_response><|assistant|><think>"]),
+    format_tools=ToolFormatter(tool_format="glm5_next"),
+    format_prefix=EmptyFormatter(slots=["[gMASK]<sop><|system|>Reasoning Effort: Max"]),
+    stop_words=["<|user|>", "<|observation|>"],
+    thought_words=("<think>", "</think>"),
+    preserve_thinking=True,
+    mm_plugin=get_mm_plugin(name="glm5_next", image_token="<|image|>", video_token="<|video|>"),
+    template_class=Glm5NextTemplate,
 )
 
 
@@ -1526,6 +1797,32 @@ register_template(
 )
 
 
+# copied from qwen template
+register_template(
+    name="moss_vl",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_function=FunctionFormatter(slots=["{{content}}<|im_end|>\n"], tool_format="qwen"),
+    format_observation=StringFormatter(
+        slots=["<|im_start|>user\n<tool_response>\n{{content}}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"]
+    ),
+    format_tools=ToolFormatter(tool_format="qwen"),
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    mm_plugin=get_mm_plugin(
+        name="moss_vl",
+        image_token="<|image_pad|>",
+        video_token="<|video_pad|>",
+        vision_bos_token="<|vision_start|>",
+        vision_eos_token="<|vision_end|>",
+        time_bos_token="<|time_start|>",
+        time_eos_token="<|time_end|>",
+    ),
+    template_class=MossVLTemplate,
+)
+
+
 # copied from vicuna template
 register_template(
     name="llava",
@@ -1750,6 +2047,23 @@ register_template(
     stop_words=["<|im_end|>"],
     default_system="You are a helpful assistant. You can accept audio and text input and output voice and text.",
     mm_plugin=get_mm_plugin(name="minicpm_v", image_token="<image>", video_token="<video>", audio_token="<audio>"),
+)
+
+
+register_template(
+    name="minicpm5",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_function=FunctionFormatter(slots=["{{content}}<|im_end|>\n"], tool_format="minicpm5"),
+    format_observation=StringFormatter(
+        slots=["<|im_start|>user\n<tool_response>\n{{content}}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"]
+    ),
+    format_tools=ToolFormatter(tool_format="minicpm5"),
+    format_prefix=EmptyFormatter(slots=[{"bos_token"}]),
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    template_class=ReasoningTemplate,
 )
 
 
@@ -2199,6 +2513,24 @@ register_template(
 
 
 register_template(
+    name="qwen3_8",
+    format_user=StringFormatter(slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+    format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+    format_system=StringFormatter(slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+    format_function=FunctionFormatter(slots=["{{content}}<|im_end|>\n"], tool_format="qwen3_8"),
+    format_observation=StringFormatter(
+        slots=["<|im_start|>user\n<tool_response>\n{{content}}\n</tool_response><|im_end|>\n<|im_start|>assistant\n"]
+    ),
+    format_tools=ToolFormatter(tool_format="qwen3_8"),
+    stop_words=["<|im_end|>"],
+    replace_eos=True,
+    preserve_thinking=True,
+    mm_plugin=get_mm_plugin(name="qwen3_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"),
+    template_class=Qwen38ReasoningTemplate,
+)
+
+
+register_template(
     name="sailor",
     format_user=StringFormatter(slots=["<|im_start|>question\n{{content}}<|im_end|>\n<|im_start|>answer\n"]),
     format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
@@ -2282,6 +2614,25 @@ register_template(
     default_system=(
         "你是中国电信星辰语义大模型，英文名是TeleChat，你是由中电信人工智能科技有限公司和中国电信人工智能研究院（TeleAI）研发的人工智能助手。"
     ),
+)
+
+
+register_template(
+    name="xing4_0",
+    format_user=StringFormatter(slots=["<_user>{{content}}<_bot>"]),
+    format_assistant=StringFormatter(slots=["{{content}}", {"eos_token"}, "\n"]),
+    format_function=FunctionFormatter(
+        slots=["{{content}}", {"eos_token"}, "\n"], tool_format="xing4"
+    ),
+    format_system=StringFormatter(slots=["{{content}}"]),
+    format_observation=StringFormatter(
+        slots=["<_observation><tool_response>{{content}}</tool_response><_bot>"]
+    ),
+    format_prefix=EmptyFormatter(slots=["<_system>"]),
+    format_tools=ToolFormatter(tool_format="xing4"),
+    thought_words=("<think>\n", "</think>"),
+    tool_call_words=("<tool_call>", "</tool_call>"),
+    template_class=Xing4ReasoningTemplate,
 )
 
 
